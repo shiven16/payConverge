@@ -87,6 +87,15 @@ CREATE TABLE IF NOT EXISTS convergence_lags (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS runtime_controls (
+  control_name TEXT PRIMARY KEY,
+  enabled BOOLEAN NOT NULL
+);
+
+INSERT INTO runtime_controls(control_name, enabled)
+VALUES('webhook_ingestion', true), ('recovery_sweeper', true)
+ON CONFLICT(control_name) DO NOTHING;
+
 CREATE INDEX IF NOT EXISTS idx_webhook_events_payment ON webhook_events(payment_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_ready ON outbox_commands(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_decisions_payment ON payment_decisions(payment_id, created_at);

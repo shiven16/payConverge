@@ -8,6 +8,7 @@ export type Config = {
   stuckAfterSeconds: number;
   outboxMaxAttempts: number;
   disableDedup: boolean;
+  runBackgroundProcesses: boolean;
 };
 
 export function config(): Config {
@@ -20,6 +21,7 @@ export function config(): Config {
     hyperswitchApiKey: process.env.HYPERSWITCH_API_KEY ?? "",
     stuckAfterSeconds: Number(process.env.STUCK_AFTER_SECONDS ?? 900),
     outboxMaxAttempts: Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 5),
-    disableDedup: process.env.DISABLE_DEDUP === "1"
+    disableDedup: process.env.DISABLE_DEDUP === "1",
+    runBackgroundProcesses: process.env.RUN_BACKGROUND_PROCESSES === "1" || process.env.RUN_BACKGROUND_PROCESSES === "true"
   };
 }

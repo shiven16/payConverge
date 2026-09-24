@@ -2,7 +2,7 @@ import pg from "pg";
 import { authorityClient, AuthorityClient } from "./authority.js";
 import { config } from "./config.js";
 import { incMetric, tx } from "./db.js";
-import { commandSpecs, isContradictoryTerminal, isImplausibleJump, isStale, isSupportedPaymentEvent, terminalStatuses } from "./state.js";
+import { commandSpecs, isSupportedPaymentEvent, terminalStatuses, transitionDecision } from "./state.js";
 import { ExtractedEvent, HyperswitchWebhook, PaymentStatus } from "./types.js";
 
 export async function ingestValidEvent(rawBody: string, payload: HyperswitchWebhook, event: ExtractedEvent) {
@@ -47,27 +47,49 @@ export async function ingestValidEvent(rawBody: string, payload: HyperswitchWebh
 
 export async function applyPaymentEvent(client: pg.PoolClient, event: ExtractedEvent, authority: AuthorityClient) {
   if (!event.paymentId || !event.status) return;
+  await lockPayment(client, event.paymentId);
   const locked = await client.query("SELECT * FROM payments WHERE payment_id = $1 FOR UPDATE", [event.paymentId]);
   const current = locked.rows[0] as
     | { status: PaymentStatus; provider_updated_at: Date | null; conflict_pending: boolean }
     | undefined;
 
-  if (current && isStale(current.provider_updated_at, event.providerUpdatedAt)) {
-    await decision(client, event.paymentId, event.eventId, "stale_ignored", `Ignored stale ${event.status}; stored state is ${current.status}`, {
-      current_updated_at: current.provider_updated_at,
+  const transition = transitionDecision(current?.status ?? null, event.status, current?.provider_updated_at ?? null, event.providerUpdatedAt);
+
+  if (transition === "conflict") {
+    const reason = `${current?.status} conflicted with incoming ${event.status}`;
+    await recordConflict(client, event.paymentId, event.eventId, reason);
+    try {
+      await verifyAndReconcile(client, event.paymentId, event.eventId, authority, current?.status);
+    } catch (error) {
+      if (isPostgresError(error)) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      await decision(client, event.paymentId, event.eventId, "verification_failed", `Authority lookup failed; conflict remains flagged: ${message}`);
+      await incMetric(client, "conflicts_flagged");
+    }
+    return;
+  }
+
+  if (transition === "stale" || transition === "terminal_regression") {
+    const reason = transition === "terminal_regression"
+      ? `Ignored ${event.status}; terminal state ${current?.status} cannot regress`
+      : `Ignored stale ${event.status}; stored state is ${current?.status}`;
+    await decision(client, event.paymentId, event.eventId, "stale_ignored", reason, {
+      current_updated_at: current?.provider_updated_at ?? null,
       incoming_updated_at: event.providerUpdatedAt
     });
     await incMetric(client, "stale_events_ignored");
     return;
   }
 
-  if (current && (isContradictoryTerminal(current.status, event.status) || isImplausibleJump(current.status, event.status))) {
-    await recordConflict(client, event.paymentId, event.eventId, `${current.status} conflicted with incoming ${event.status}`);
-    await verifyAndReconcile(client, event.paymentId, event.eventId, authority, current.status);
-    return;
-  }
-
   await setPaymentState(client, event.paymentId, event.status, event.providerUpdatedAt, current?.status ?? null, event.eventId, "applied", "Applied newest non-conflicting payment state");
+}
+
+function isPostgresError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && /^[0-9A-Z]{5}$/.test(String(error.code));
+}
+
+export async function lockPayment(client: pg.PoolClient, paymentId: string) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [paymentId]);
 }
 
 export async function verifyAndReconcile(
@@ -76,13 +98,20 @@ export async function verifyAndReconcile(
   eventId: string | null,
   authority: AuthorityClient,
   previousStatus?: PaymentStatus
-) {
+): Promise<boolean> {
   const authoritative = await authority.getPayment(paymentId, client);
   if (!authoritative) {
     await decision(client, paymentId, eventId, "verification_missing", "Authority lookup returned no payment; conflict left visible");
     await incMetric(client, "conflicts_flagged");
-    return;
+    return false;
   }
+  if (previousStatus && terminalStatuses.has(previousStatus) && terminalStatuses.has(authoritative.status) && previousStatus !== authoritative.status) {
+    const pending = await client.query("SELECT 1 FROM conflicts WHERE payment_id = $1 AND status = 'pending' LIMIT 1", [paymentId]);
+    if (pending.rowCount === 0) {
+      await recordConflict(client, paymentId, eventId, `Local terminal state ${previousStatus} conflicted with authority ${authoritative.status}`);
+    }
+  }
+  const changed = previousStatus !== authoritative.status;
   await setPaymentState(
     client,
     paymentId,
@@ -93,11 +122,12 @@ export async function verifyAndReconcile(
     "verification_pulled",
     `Authority resolved payment as ${authoritative.status}`
   );
-  await client.query(
+  const resolved = await client.query(
     "UPDATE conflicts SET status = 'resolved', authority_status = $2, resolved_at = now() WHERE payment_id = $1 AND status = 'pending'",
     [paymentId, authoritative.status]
   );
-  await incMetric(client, "conflicts_resolved");
+  if ((resolved.rowCount ?? 0) > 0) await incMetric(client, "conflicts_resolved");
+  return changed;
 }
 
 export async function setPaymentState(
@@ -115,7 +145,7 @@ export async function setPaymentState(
      VALUES($1, $2, $3, $4, false, $2, now())
      ON CONFLICT(payment_id) DO UPDATE
        SET status = EXCLUDED.status,
-           provider_updated_at = EXCLUDED.provider_updated_at,
+           provider_updated_at = COALESCE(EXCLUDED.provider_updated_at, payments.provider_updated_at),
            terminal = EXCLUDED.terminal,
            conflict_pending = false,
            authority_status = EXCLUDED.authority_status,
@@ -137,7 +167,7 @@ export async function setPaymentState(
   }
 }
 
-async function recordConflict(client: pg.PoolClient, paymentId: string, eventId: string, reason: string) {
+async function recordConflict(client: pg.PoolClient, paymentId: string, eventId: string | null, reason: string) {
   await client.query("UPDATE payments SET conflict_pending = true WHERE payment_id = $1", [paymentId]);
   await client.query("INSERT INTO conflicts(payment_id, event_id, reason) VALUES($1, $2, $3)", [paymentId, eventId, reason]);
   await decision(client, paymentId, eventId, "conflict_detected", reason);

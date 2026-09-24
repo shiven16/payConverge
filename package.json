@@ -4,15 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --env-file=.env --import tsx src/server.ts",
+    "dev": "node --env-file-if-exists=.env --import tsx src/server.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node --env-file=.env dist/src/server.js",
-    "migrate": "node --env-file=.env --import tsx src/migrate.ts",
-    "test": "node --env-file=.env --import tsx ./node_modules/vitest/vitest.mjs run",
-    "chaos": "node --env-file=.env --import tsx src/chaos.ts",
-    "demo:send": "node --env-file=.env --import tsx src/send-simulated-event.ts",
-    "worker": "node --env-file=.env --import tsx src/worker.ts",
-    "sweeper": "node --env-file=.env --import tsx src/sweeper.ts"
+    "start": "node --env-file-if-exists=.env dist/src/server.js",
+    "migrate": "node --env-file-if-exists=.env --import tsx src/migrate.ts",
+    "test": "node --env-file-if-exists=.env --import tsx ./node_modules/vitest/vitest.mjs run",
+    "chaos": "node --env-file-if-exists=.env --import tsx src/chaos.ts",
+    "demo:send": "node --env-file-if-exists=.env --import tsx src/send-simulated-event.ts",
+    "demo:scenario": "node --env-file-if-exists=.env --import tsx src/demo-scenarios.ts",
+    "worker": "node --env-file-if-exists=.env --import tsx src/worker.ts",
+    "sweeper": "node --env-file-if-exists=.env --import tsx src/sweeper.ts"
   },
   "dependencies": {
     "fastify": "^4.28.1",

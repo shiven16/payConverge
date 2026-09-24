@@ -1,17 +1,17 @@
-# Payment State Convergence Engine
+# PayConverge
 
-Merchant-side convergence engine for Hyperswitch webhooks. It demonstrates how a merchant can accept at-least-once, out-of-order payment webhooks, keep side effects idempotent, detect suspicious terminal conflicts, and repair drift by pulling authoritative payment state.
+PayConverge is a merchant-side payment state convergence engine built around Hyperswitch webhook delivery. Hyperswitch retries failed webhooks up to 16 times over roughly 24 hours, so a longer merchant outage can leave local state silently behind. Deduplicating `event_id` and ordering payment updates by `content.object.updated` are the documented baseline; this project focuses on authority-backed repair, reversible/idempotent business effects, and proving behavior under adversarial delivery. It is not settlement-file reconciliation.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  HS[Hyperswitch webhook] --> API[Fastify raw-body webhook API]
-  API --> DB[(Postgres)]
-  DB --> Engine[Convergence engine]
-  Engine --> Authority[Mock or Hyperswitch authority]
+  HS[Hyperswitch webhook] --> API[Fastify API]
+  API --> PG[(Postgres)]
+  API --> Engine[Convergence engine]
+  Engine --> Authority[Mock or Hyperswitch retrieve]
   Engine --> Outbox[Transactional outbox]
-  Outbox --> Workers[Mock order/inventory/notifier]
+  Outbox --> Consumers[Mock order inventory notifier]
   Sweeper[Recovery sweeper] --> Authority
   Sweeper --> Engine
   API --> Metrics[/metrics]
@@ -20,43 +20,35 @@ flowchart LR
 
 ## State Model
 
-Payment events are ordered by `content.object.updated` when present. A stored payment never regresses to an older provider timestamp. Terminal states are `succeeded`, `failed`, and `cancelled`. Contradictory terminal transitions such as `failed -> succeeded` are not blindly overwritten: the engine records a conflict, pulls authority, then reconciles to that result. A late success after a failed payment emits compensation commands instead of silently treating the old cancellation as final.
+Supported event types are `payment_succeeded`, `payment_failed`, `payment_processing`, `payment_cancelled`, `payment_authorized`, `payment_captured`, and `action_required`. Event status is read from `content.object.status` (with event-type mapping as fallback); unsupported events, including `payment_expired`, are durably recorded and acknowledged but do not change payment state.
 
-Supported payment webhook event names are `payment_succeeded`, `payment_failed`, `payment_processing`, `payment_cancelled`, `payment_authorized`, `payment_captured`, and `action_required`. Unknown events are stored and acknowledged.
+The non-terminal progression is `requires_payment_method < requires_confirmation < requires_customer_action < requires_merchant_action < processing < authorized < partially_captured`; `succeeded`, `failed`, and `cancelled` are terminal. A non-terminal update cannot replace an already-terminal state. Older `content.object.updated` values are ignored. At equal timestamps, the explicit progression rank breaks ties, so a lower-ranked status cannot regress a higher-ranked one. Contradictory terminal states are recorded as conflicts and verified against the configured authority; they are never resolved by timestamp alone. When event timestamps are missing, arrival order is used for non-terminal updates, while terminal-regression and conflict rules still apply.
 
-## Guarantees
+## Guarantees and Limits
 
-- Valid signed events are persisted before acknowledgement.
-- Duplicate `event_id`s are acknowledged but not reapplied.
-- State changes and business commands are recorded in the same transaction.
-- Outbox commands use stable idempotency keys and `FOR UPDATE SKIP LOCKED`.
-- The sweeper is safe to rerun and repairs known local payments whose webhooks were dropped.
-- Metrics and timeline endpoints explain duplicates, stale ignores, conflicts, verification, commands, retries, and dead letters.
+- Valid signed webhook payloads are stored before the endpoint acknowledges them; a database uniqueness constraint and payment-scoped advisory transaction lock serialize duplicate and first-event races.
+- State updates and generated commands commit in one transaction. Outbox workers claim rows using `FOR UPDATE SKIP LOCKED`; command idempotency keys protect downstream effects. The mock consumers persist effect keys transactionally.
+- The sweeper and ingestion use the same per-payment advisory lock, and multiple sweepers skip payments already being processed. The sweeper repairs registered payments, not unknown checkout intents.
+- Conflicts are retained in the timeline and resolved from authority or left visibly flagged when authority is unavailable.
+- The chaos harness uses a separate reference consumer and checks convergence after sweep, stale-event monotonicity, command delivery/idempotency, conflict visibility/resolution, and transient-failure recovery.
+- This does not provide exactly-once network delivery; it provides retryable delivery with idempotent effects. Signature verification authenticates the raw body only, not freshness. `event_id` deduplication is the replay defense.
+- Refunds, disputes, authentication, ledger behavior, real merchant systems, and settlement reconciliation are out of scope. Use HTTPS when exposing the endpoint publicly.
 
-## Non-Guarantees
+## Hyperswitch Contract
 
-This is not settlement reconciliation, a ledger, multi-tenant auth, or a real PSP integration. Refund/dispute convergence is intentionally cut. Full outage repair assumes the merchant already has local payment intent rows to sweep; the harness seeds those rows to model checkout creation.
+The implementation follows the official [webhook guide](https://docs.hyperswitch.io/integration-guide/webhooks.md), [outgoing webhook schema](https://api-reference.hyperswitch.io/api-reference/schemas/outgoing--webhook), and [payment retrieve API](https://api-reference.hyperswitch.io/v1/payments/payments--retrieve). The verified webhook contract used here includes `event_id`, `x-webhook-signature-512`, HMAC-SHA512 over the raw body with the business profile `payment_response_hash_key`, and the payment ordering timestamp `content.object.updated`. The retrieve client calls `GET /payments/{payment_id}` with `api-key`.
 
-## Hyperswitch Facts Verified
-
-Official docs/API reference used:
-
-- Webhook guide: `https://docs.hyperswitch.io/integration-guide/webhooks.md`
-- Outgoing webhook schema: `https://api-reference.hyperswitch.io/api-reference/schemas/outgoing--webhook`
-- Payment retrieve API: `https://api-reference.hyperswitch.io/v1/payments/payments--retrieve`
-
-Used facts: HMAC-SHA512 signature in `x-webhook-signature-512`; key is the business profile `payment_response_hash_key`; delivery expects 2xx and retries up to 16 attempts over roughly 24 hours; consumers should deduplicate by `event_id`; payment ordering uses `content.object.updated`; payment retrieval is `GET /payments/{payment_id}` with `api-key`.
+The retrieve client is implemented against the documented API, **not yet run against a Hyperswitch sandbox**. No sandbox credentials were available for this verification.
 
 ## Run Locally
-
-Start Postgres, the API, the outbox worker, and the recovery sweeper together:
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
+curl http://localhost:3000/healthz
 ```
 
-The API is available at `http://localhost:3000`. To run the TypeScript processes outside Docker instead, install dependencies and run the commands below; each loads values from `.env`:
+Compose starts Postgres, API, worker, and sweeper. The sample signing key is for local use only. For local processes outside Docker, install dependencies, ensure `.env` points to a reachable Postgres, then run migrations and processes in separate terminals:
 
 ```bash
 npm install
@@ -66,68 +58,78 @@ npm run worker
 npm run sweeper
 ```
 
-Send a correctly signed simulated webhook:
+The merchant must register a payment intent before a webhook-free outage can be repaired:
 
 ```bash
-npm run demo:send -- pay_demo succeeded
-curl http://localhost:3000/payments/pay_demo/timeline
-curl http://localhost:3000/metrics
+curl -X POST http://localhost:3000/payments/pay_demo/register
 ```
 
-## Demo Scenarios
+`POST /payments/:paymentId/register` is idempotent. Other endpoints: `POST /webhooks/hyperswitch`, `GET /metrics`, `GET /payments/:paymentId/timeline`, `GET /dead-letters`, and `POST /dead-letters/:id/retry`.
 
-Happy path:
+## Demos
+
+Signed simulated happy path:
 
 ```bash
 npm run demo:send -- pay_happy succeeded
-npm run worker -- --once
 curl http://localhost:3000/payments/pay_happy/timeline
 ```
 
-Chaos run:
+Conflict (failure, then a late success with an older provider timestamp):
 
 ```bash
-npm run chaos -- --seed=42 --payments=300
-DISABLE_DEDUP=1 npm run chaos -- --seed=42 --payments=300 --expect-failure=true
+npm run demo:scenario -- conflict
 ```
 
-Conflict:
+Expected output includes `conflict_detected`, `verification_pulled`, and a delivered `compensate_late_success` command. The script prints the generated payment ID and timeline evidence.
+
+Outage recovery (three registered payments move in mock authority while webhook ingestion and the sweeper are disabled; no webhook redelivery is performed):
 
 ```bash
-npm run chaos -- --seed=7 --payments=50
-curl http://localhost:3000/metrics
+npm run demo:scenario -- outage
 ```
 
-Outage recovery is covered by the chaos harness: it drops events while authority rows continue to move forward, then the sweeper repairs known local payment intents without webhook redelivery.
+Expected JSON reports `webhook_attempts_rejected: 3`, `webhook_redeliveries: 0`, drift before the sweep, drift after the sweep as `0`, and `repaired_by_sweeper: 3`.
+
+Chaos runs need an isolated/throwaway database because the harness resets its test tables. Enable that destructive action explicitly:
+
+```bash
+CHAOS_ALLOW_RESET=1 npm run chaos -- --seed=17 --payments=300
+CHAOS_ALLOW_RESET=1 npm run chaos -- --seed=17 --payments=300 --concurrent=true
+```
+
+The concurrent mode runs multiple delivery workers and the sweeper alongside event ingestion. Runs print the seed and replay command. To verify the harness catches a disabled dedup safeguard, run the same seed with `DISABLE_DEDUP=1`; the command exits nonzero on violated invariants and prints a replayable seed:
+
+```bash
+CHAOS_ALLOW_RESET=1 DISABLE_DEDUP=1 npm run chaos -- --seed=17 --payments=300
+```
+
+Reset the isolated DB between chaos runs if needed. Captured run output should be added here after running these commands against the current checkout; no sample numbers are claimed in this README.
 
 ## Tests
 
+The test suite includes unit tests for signature verification and state rules, plus Postgres integration tests for concurrent duplicate/first-event ingestion, transactional rollback, multiple concurrent workers, and concurrent sweepers/live ingestion. Integration tests fail by default if Postgres is unavailable; skipping them requires an explicit `SKIP_DB_TESTS=1`.
+
 ```bash
+docker compose up -d postgres
 npm test
+SKIP_DB_TESTS=1 npm test
 ```
 
-Unit tests cover signature verification and convergence rules. Integration tests exercise Postgres deduplication, atomic state-plus-command recording, and idempotent delivery; they skip DB assertions when Postgres is not reachable.
+The second command is a deliberate unit-only run and reports the database tests as skipped. CI runs the suite against a Postgres service container.
 
 ## Deployment
 
-Deploy the Docker image to Render, Railway, Fly.io, or any host that supports a container plus managed Postgres. Set:
+`render.yaml` defines a Render Docker web service and managed Postgres database. Create a Blueprint deployment from that file, set the secrets in the Render dashboard, and configure Hyperswitch's webhook destination to the HTTPS `/webhooks/hyperswitch` URL with the matching signing key. `RUN_BACKGROUND_PROCESSES=true` runs worker and sweeper loops inside the web process for a single-service deployment; set it to `false` when running separate worker processes. Do not scale this embedded-worker setup into multiple web replicas unless you intend to run a worker loop per replica (database locking prevents duplicate claims).
 
-- `DATABASE_URL`
-- `WEBHOOK_SIGNING_KEY`
-- `AUTHORITY_MODE=mock` or `hyperswitch`
-- `HYPERSWITCH_BASE_URL`
-- `HYPERSWITCH_API_KEY`
-- `STUCK_AFTER_SECONDS`
-- `OUTBOX_MAX_ATTEMPTS`
-
-Run `npm run migrate` as a release step, then run the web process. Run `npm run worker` and `npm run sweeper` as background workers.
+Live URL: **not deployed** (placeholder).
 
 ## Real vs Simulated
 
-Real: raw-body HMAC verification, durable webhook ingestion, event deduplication, payment convergence, conflict handling, outbox retries, sweeper logic, metrics, timeline, and the real Hyperswitch payment retrieve client.
+Real implementation: raw-body HMAC verification, Postgres-backed ingestion/deduplication, transition and conflict rules, transactionally recorded outbox commands, retries/dead letters, recovery logic, API metrics/timeline, and the Hyperswitch retrieve client implemented against its documented API. The retrieve client has not been sandbox-tested.
 
-Simulated: generated webhook delivery faults, mock authority data, and mock merchant services for orders, inventory, and notifications.
+Simulated: generated Hyperswitch-shaped events and delivery faults in the chaos harness, the mock authority used by local demos, and mock order/inventory/notifier consumers. No real merchant side effects are performed.
 
-## What I Would Do Next
+## Next
 
-Add refund-specific convergence, richer sweeper discovery from merchant order tables, OpenTelemetry export, a small static dashboard, and CI with a real Postgres service.
+Run the retrieve client against sandbox credentials, capture the chaos and demo outputs above, then add refund-specific ordering and operational tracing if scope permits.

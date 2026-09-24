@@ -7,22 +7,48 @@ import { verifyAndReconcile } from "./engine.js";
 export async function runSweeper(limit = 100): Promise<number> {
   const cfg = config();
   return tx(async (client) => {
-    const result = await client.query(
+    const control = await client.query("SELECT enabled FROM runtime_controls WHERE control_name = 'recovery_sweeper'");
+    if (control.rows[0]?.enabled === false) return 0;
+    const candidates = await client.query(
       `SELECT payment_id, status
        FROM payments
        WHERE conflict_pending = true
-          OR terminal = false
-          OR updated_at < now() - ($1 || ' seconds')::interval
+          OR (terminal = false AND updated_at < now() - ($1 || ' seconds')::interval)
+          OR EXISTS (
+            SELECT 1 FROM authority_payments a
+            WHERE a.payment_id = payments.payment_id AND a.status IS DISTINCT FROM payments.status
+          )
        ORDER BY updated_at
-       LIMIT $2
-       FOR UPDATE SKIP LOCKED`,
+       LIMIT $2`,
       [cfg.stuckAfterSeconds, limit]
     );
-    for (const row of result.rows) {
-      await verifyAndReconcile(client, row.payment_id, null, authorityClient(), row.status);
-      await incMetric(client, "payments_repaired_by_sweeper");
+    let repaired = 0;
+    for (const candidate of candidates.rows) {
+      const claimed = await client.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked", [candidate.payment_id]);
+      if (!claimed.rows[0].locked) continue;
+      const current = await client.query(
+        `SELECT payment_id, status, conflict_pending
+         FROM payments
+         WHERE payment_id = $1
+           AND (
+             conflict_pending = true
+             OR (terminal = false AND updated_at < now() - ($2 || ' seconds')::interval)
+             OR EXISTS (
+               SELECT 1 FROM authority_payments a
+               WHERE a.payment_id = payments.payment_id AND a.status IS DISTINCT FROM payments.status
+             )
+           )
+         FOR UPDATE`,
+        [candidate.payment_id, cfg.stuckAfterSeconds]
+      );
+      if (current.rowCount === 0) continue;
+      const changed = await verifyAndReconcile(client, candidate.payment_id, null, authorityClient(), current.rows[0].status);
+      if (changed || current.rows[0].conflict_pending) {
+        await incMetric(client, "payments_repaired_by_sweeper");
+        repaired++;
+      }
     }
-    return result.rowCount ?? 0;
+    return repaired;
   });
 }
 

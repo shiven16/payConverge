@@ -18,13 +18,13 @@ export function rng(seed: number) {
 
 export function generatePayments(seed: number, count: number): GeneratedPayment[] {
   const random = rng(seed);
-  const base = Date.parse("2026-01-01T00:00:00.000Z");
+  const base = Date.now() - 60_000;
   const payments: GeneratedPayment[] = [];
   for (let i = 0; i < count; i++) {
     const paymentId = `pay_${seed}_${i}`;
     const succeeds = random() > 0.25;
     const statuses: PaymentStatus[] = succeeds ? ["processing", "authorized", "succeeded"] : ["processing", "failed"];
-    const events = statuses.map((status, index) => webhook(paymentId, `evt_${seed}_${i}_${index}`, status, new Date(base + i * 10000 + index * 1000)));
+    const events = statuses.map((status, index) => webhook(paymentId, `evt_${seed}_${i}_${index}`, status, new Date(base + i * 100 + index * 1000)));
     payments.push({ paymentId, finalStatus: statuses[statuses.length - 1], events });
   }
   return payments;
@@ -33,6 +33,7 @@ export function generatePayments(seed: number, count: number): GeneratedPayment[
 export function adversarialDelivery(seed: number, payments: GeneratedPayment[]) {
   const random = rng(seed ^ 0x9e3779b9);
   const delivered: HyperswitchWebhook[] = [];
+  const beforeShuffle: HyperswitchWebhook[] = [];
   let duplicated = 0;
   let dropped = 0;
   let staleInjected = 0;
@@ -48,13 +49,28 @@ export function adversarialDelivery(seed: number, payments: GeneratedPayment[]) 
         duplicated++;
       }
     }
-    if (random() < 0.06) {
-      delivered.push(webhook(payment.paymentId, `evt_${seed}_${payment.paymentId}_late_conflict`, "succeeded", new Date("2026-01-01T00:00:00.500Z")));
+    if (payment.finalStatus === "failed" && random() < 0.35) {
+      const processingTime = Date.parse(String(payment.events[0].content?.object?.updated));
+      delivered.push(webhook(payment.paymentId, `evt_${seed}_${payment.paymentId}_late_conflict`, "succeeded", new Date(processingTime + 500)));
       staleInjected++;
     }
   }
-  delivered.sort(() => random() - 0.5);
-  return { delivered, duplicated, dropped, staleInjected };
+  beforeShuffle.push(...delivered);
+  for (let index = delivered.length - 1; index > 0; index--) {
+    const other = Math.floor(random() * (index + 1));
+    [delivered[index], delivered[other]] = [delivered[other], delivered[index]];
+  }
+  let delayed = 0;
+  const newestSeen = new Map<string, number>();
+  for (const event of delivered) {
+    const object = event.content?.object;
+    const paymentId = String(object?.payment_id ?? "");
+    const updated = Date.parse(String(object?.updated ?? ""));
+    if ((newestSeen.get(paymentId) ?? -Infinity) > updated) delayed++;
+    newestSeen.set(paymentId, Math.max(newestSeen.get(paymentId) ?? -Infinity, updated));
+  }
+  const reordered = delivered.reduce((count, event, index) => count + Number(event.event_id !== beforeShuffle[index].event_id), 0);
+  return { delivered, duplicated, dropped, staleInjected, delayed, reordered };
 }
 
 export function webhook(paymentId: string, eventId: string, status: PaymentStatus, updated: Date): HyperswitchWebhook {

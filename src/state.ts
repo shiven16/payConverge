@@ -2,6 +2,19 @@ import { ExtractedEvent, HyperswitchWebhook, PaymentStatus } from "./types.js";
 
 export const terminalStatuses = new Set<PaymentStatus>(["succeeded", "failed", "cancelled"]);
 
+const statusOrder: Record<PaymentStatus, number> = {
+  requires_payment_method: 0,
+  requires_confirmation: 1,
+  requires_customer_action: 2,
+  requires_merchant_action: 3,
+  processing: 4,
+  authorized: 5,
+  partially_captured: 6,
+  succeeded: 7,
+  failed: 7,
+  cancelled: 7
+};
+
 const eventStatus: Record<string, PaymentStatus> = {
   payment_succeeded: "succeeded",
   payment_failed: "failed",
@@ -40,22 +53,33 @@ export function extractEvent(payload: HyperswitchWebhook): ExtractedEvent {
 }
 
 export function isSupportedPaymentEvent(eventType: string): boolean {
-  return eventType in eventStatus || eventType.startsWith("payment_") || eventType === "action_required";
+  return Object.hasOwn(eventStatus, eventType);
 }
 
-export function isStale(currentUpdated: Date | null, incomingUpdated: Date | null): boolean {
-  if (!currentUpdated || !incomingUpdated) return false;
-  return incomingUpdated.getTime() < currentUpdated.getTime();
+export type TransitionDecision = "apply" | "stale" | "terminal_regression" | "conflict";
+
+export function transitionDecision(
+  current: PaymentStatus | null,
+  incoming: PaymentStatus,
+  currentUpdated: Date | null,
+  incomingUpdated: Date | null
+): TransitionDecision {
+  if (!current) return "apply";
+  if (terminalStatuses.has(current)) {
+    if (terminalStatuses.has(incoming) && current !== incoming) return "conflict";
+    if (!terminalStatuses.has(incoming)) return "terminal_regression";
+  }
+  if (terminalStatuses.has(current) && current === incoming) {
+    return incomingUpdated && currentUpdated && incomingUpdated.getTime() < currentUpdated.getTime() ? "stale" : "apply";
+  }
+  if (incomingUpdated && currentUpdated && incomingUpdated.getTime() < currentUpdated.getTime()) return "stale";
+  if (statusOrder[incoming] < statusOrder[current]) return "stale";
+  if (terminalStatuses.has(current) && terminalStatuses.has(incoming) && current !== incoming) return "conflict";
+  return "apply";
 }
 
 export function isContradictoryTerminal(current: PaymentStatus, incoming: PaymentStatus): boolean {
   return terminalStatuses.has(current) && terminalStatuses.has(incoming) && current !== incoming;
-}
-
-export function isImplausibleJump(current: PaymentStatus, incoming: PaymentStatus): boolean {
-  if (current === "succeeded" && incoming !== "succeeded") return true;
-  if (current === "cancelled" && incoming === "authorized") return true;
-  return false;
 }
 
 export function commandSpecs(paymentId: string, previous: PaymentStatus | null, next: PaymentStatus) {
@@ -73,6 +97,7 @@ export function commandSpecs(paymentId: string, previous: PaymentStatus | null, 
   }
   if ((next === "failed" || next === "cancelled") && previous !== next) {
     return [
+      spec(paymentId, "cancel_order", "orders"),
       spec(paymentId, "release_stock", "inventory"),
       spec(paymentId, "notify_failure", "notifier")
     ];

@@ -14,14 +14,19 @@ export async function deliverDueCommands(limit = 25): Promise<number> {
        FOR UPDATE SKIP LOCKED`,
       [limit]
     );
+    const metricIncrements = new Map<string, number>();
     for (const command of result.rows) {
-      await deliverOne(client, command);
+      const metric = await deliverOne(client, command);
+      if (metric) metricIncrements.set(metric, (metricIncrements.get(metric) ?? 0) + 1);
+    }
+    for (const [name, increment] of [...metricIncrements].sort(([left], [right]) => left.localeCompare(right))) {
+      await incMetric(client, name, increment);
     }
     return result.rowCount ?? 0;
   });
 }
 
-async function deliverOne(client: pg.PoolClient, command: pg.QueryResultRow) {
+async function deliverOne(client: pg.PoolClient, command: pg.QueryResultRow): Promise<string | null> {
   try {
     await mockMerchantConsumer(client, command);
     await client.query("UPDATE outbox_commands SET status = 'delivered', delivered_at = now(), last_error = null WHERE id = $1", [command.id]);
@@ -36,6 +41,7 @@ async function deliverOne(client: pg.PoolClient, command: pg.QueryResultRow) {
         Date.now() - new Date(providerUpdatedAt).getTime()
       ]);
     }
+    return null;
   } catch (error) {
     const attempts = Number(command.attempts) + 1;
     const message = error instanceof Error ? error.message : String(error);
@@ -46,7 +52,7 @@ async function deliverOne(client: pg.PoolClient, command: pg.QueryResultRow) {
         message
       ]);
       await decision(client, command.payment_id, null, "command_dead_lettered", message, { idempotency_key: command.idempotency_key });
-      await incMetric(client, "dead_letter_count");
+      return "dead_letter_count";
     } else {
       const jitterMs = Math.floor(Math.random() * 250);
       const delaySeconds = Math.min(60, 2 ** attempts) + jitterMs / 1000;
@@ -57,7 +63,7 @@ async function deliverOne(client: pg.PoolClient, command: pg.QueryResultRow) {
         [command.id, attempts, message, delaySeconds]
       );
       await decision(client, command.payment_id, null, "command_retry", message, { attempts, idempotency_key: command.idempotency_key });
-      await incMetric(client, "delivery_retries");
+      return "delivery_retries";
     }
   }
 }

@@ -26,7 +26,7 @@ services:
       - "3000:3000"
     command: sh -c "node dist/src/migrate.js && node dist/src/server.js"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/metrics').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 5s
       timeout: 3s
       retries: 20

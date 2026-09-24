@@ -1,10 +1,12 @@
 import Fastify from "fastify";
 import { config } from "./config.js";
-import { pool } from "./db.js";
-import { ingestValidEvent } from "./engine.js";
+import { pool, tx } from "./db.js";
+import { decision, ingestValidEvent, lockPayment } from "./engine.js";
 import { extractEvent } from "./state.js";
 import { verifyWebhookSignature } from "./signature.js";
 import { HyperswitchWebhook } from "./types.js";
+import { deliverDueCommands } from "./worker.js";
+import { runSweeper } from "./sweeper.js";
 import { retryDeadLetter } from "./worker.js";
 
 export function buildServer() {
@@ -15,12 +17,37 @@ export function buildServer() {
     done(null, body);
   });
 
+  app.get("/healthz", async (_request, reply) => {
+    await pool.query("SELECT 1");
+    return reply.code(200).send({ status: "ok" });
+  });
+
+  app.post("/payments/:paymentId/register", async (request, reply) => {
+    const { paymentId } = request.params as { paymentId: string };
+    if (!paymentId.trim()) return reply.code(400).send({ error: "paymentId is required" });
+    const created = await tx(async (client) => {
+      await lockPayment(client, paymentId);
+      const result = await client.query(
+        `INSERT INTO payments(payment_id, status, terminal)
+         VALUES($1, 'requires_payment_method', false)
+         ON CONFLICT(payment_id) DO NOTHING
+         RETURNING payment_id`,
+        [paymentId]
+      );
+      if (result.rowCount) await decision(client, paymentId, null, "payment_registered", "Merchant payment intent registered for webhook recovery");
+      return Boolean(result.rowCount);
+    });
+    return reply.code(created ? 201 : 200).send({ payment_id: paymentId, created });
+  });
+
   app.post("/webhooks/hyperswitch", async (request, reply) => {
     const raw = Buffer.isBuffer(request.body) ? request.body : Buffer.from(String(request.body ?? ""));
     const signature = request.headers["x-webhook-signature-512"];
     if (!verifyWebhookSignature(raw, cfg.webhookSigningKey, signature)) {
       return reply.code(401).send({ error: "invalid signature" });
     }
+    const ingestion = await pool.query("SELECT enabled FROM runtime_controls WHERE control_name = 'webhook_ingestion'");
+    if (ingestion.rows[0]?.enabled === false) return reply.code(503).send({ error: "webhook ingestion temporarily unavailable" });
     let payload: HyperswitchWebhook;
     try {
       payload = JSON.parse(raw.toString("utf8")) as HyperswitchWebhook;
@@ -35,13 +62,32 @@ export function buildServer() {
     const counters = await pool.query("SELECT name, value FROM metrics_counters ORDER BY name");
     const depth = await pool.query("SELECT status, count(*)::int AS count FROM outbox_commands GROUP BY status");
     const lags = await pool.query("SELECT milliseconds FROM convergence_lags ORDER BY milliseconds");
+    const drift = await pool.query(
+      "SELECT count(*)::int AS count FROM payments p JOIN authority_payments a USING(payment_id) WHERE p.status IS DISTINCT FROM a.status"
+    );
     const values = lags.rows.map((r) => Number(r.milliseconds));
     return {
       counters: Object.fromEntries(counters.rows.map((r) => [r.name, Number(r.value)])),
       outbox: Object.fromEntries(depth.rows.map((r) => [r.status, r.count])),
+      payments_out_of_sync: drift.rows[0].count,
       convergence_lag_ms: { p50: percentile(values, 0.5), p95: percentile(values, 0.95) }
     };
   });
+
+  if (cfg.runBackgroundProcesses) {
+    const workerTimer = setInterval(() => {
+      deliverDueCommands().catch((error) => app.log.error({ error }, "background worker iteration failed"));
+    }, 1000);
+    const sweeperTimer = setInterval(() => {
+      runSweeper().catch((error) => app.log.error({ error }, "background sweeper iteration failed"));
+    }, 5000);
+    workerTimer.unref();
+    sweeperTimer.unref();
+    app.addHook("onClose", async () => {
+      clearInterval(workerTimer);
+      clearInterval(sweeperTimer);
+    });
+  }
 
   app.get("/payments/:paymentId/timeline", async (request) => {
     const { paymentId } = request.params as { paymentId: string };
