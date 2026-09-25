@@ -1,0 +1,1 @@
+{"counters":{"conflicts_detected":67,"conflicts_resolved":67,"delivery_retries":1000,"duplicates_dropped":430,"events_applied":1813,"payments_repaired_by_sweeper":82,"stale_events_ignored":868},"outbox":{"delivered":2341},"payments_out_of_sync":0,"convergence_lag_ms":{"p50":15596,"p95":59766}}

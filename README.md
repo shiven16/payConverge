@@ -14,8 +14,8 @@ flowchart LR
   Outbox --> Consumers[Mock order inventory notifier]
   Sweeper[Recovery sweeper] --> Authority
   Sweeper --> Engine
-  API --> Metrics[/metrics]
-  API --> Timeline[/payments/:id/timeline]
+  API --> Metrics["/metrics"]
+  API --> Timeline["/payments/:id/timeline"]
 ```
 
 ## State Model
@@ -104,7 +104,170 @@ The concurrent mode runs multiple delivery workers and the sweeper alongside eve
 CHAOS_ALLOW_RESET=1 DISABLE_DEDUP=1 npm run chaos -- --seed=17 --payments=300
 ```
 
-Reset the isolated DB between chaos runs if needed. Captured run output should be added here after running these commands against the current checkout; no sample numbers are claimed in this README.
+Reset the isolated DB between chaos runs if needed. The following proof was captured from this checkout against a separate Compose Postgres project (`payconverge-proof`, host port `55432`). The complete terminal output for every command is committed under [`proof-runs/`](proof-runs/); the excerpts below are copied from those outputs without changing their values.
+
+Recreate the proof stack with:
+
+```bash
+docker compose -p payconverge-proof -f docker-compose.proof.yml up -d --build
+DATABASE_URL=postgres://postgres:postgres@localhost:55432/convergence npm run migrate
+npm run build
+DATABASE_URL=postgres://postgres:postgres@localhost:55432/convergence npm test
+```
+
+Build and Postgres tests ran before the captured harness sequence: build exited `0`; tests ran `13`, passed `13`, failed `0`, skipped `0`.
+
+Sequential run (a), exit code `0`:
+
+```text
+  "seed": 17,
+  "mode": "sequential",
+  "payments": 1000,
+  "events_generated": 2742,
+  "duplicated": 430,
+  "reordered": 3026,
+  "delayed": 1094,
+  "dropped": 211,
+  "stale_ignored": 868,
+  "conflicts_detected": 66,
+  "payments_repaired_by_sweeper": 79,
+  "convergence_lag_ms_p50": 15973,
+  "convergence_lag_ms_p95": 60019,
+  "invariants": {
+    "a_final_state_matches_independent_oracle_after_sweep": true,
+    "b_state_never_regresses_on_stale_events": true,
+    "c_expected_commands_delivered_once_by_idempotency_key": true,
+    "d_every_conflict_resolved_by_authority_or_remains_flagged": true,
+    "e_transient_consumer_failures_do_not_lose_commands": true,
+    "duplicate_safeguard_observed": true
+  }
+```
+
+Concurrent workers and sweeper run (b), exit code `0`:
+
+```text
+  "seed": 17,
+  "mode": "concurrent-workers-and-sweeper",
+  "payments": 1000,
+  "events_generated": 2742,
+  "duplicated": 430,
+  "reordered": 3026,
+  "delayed": 1094,
+  "dropped": 211,
+  "stale_ignored": 1444,
+  "conflicts_detected": 66,
+  "payments_repaired_by_sweeper": 903,
+  "convergence_lag_ms_p50": 15147,
+  "convergence_lag_ms_p95": 59106,
+  "invariants": {
+    "a_final_state_matches_independent_oracle_after_sweep": true,
+    "b_state_never_regresses_on_stale_events": true,
+    "c_expected_commands_delivered_once_by_idempotency_key": true,
+    "d_every_conflict_resolved_by_authority_or_remains_flagged": true,
+    "e_transient_consumer_failures_do_not_lose_commands": true,
+    "duplicate_safeguard_observed": true
+  }
+```
+
+Dedup disabled run (c), exit code `1` as expected. The five core invariants still passed, while the deliberate safeguard invariant failed; terminal output ended with `Chaos failed for seed 17: duplicate_safeguard_observed`.
+
+```text
+  "seed": 17,
+  "mode": "sequential",
+  "payments": 1000,
+  "events_generated": 2742,
+  "duplicated": 430,
+  "reordered": 3026,
+  "delayed": 1094,
+  "dropped": 211,
+  "stale_ignored": 1064,
+  "conflicts_detected": 66,
+  "payments_repaired_by_sweeper": 79,
+  "convergence_lag_ms_p50": 15687,
+  "convergence_lag_ms_p95": 59810,
+  "invariants": {
+    "a_final_state_matches_independent_oracle_after_sweep": true,
+    "b_state_never_regresses_on_stale_events": true,
+    "c_expected_commands_delivered_once_by_idempotency_key": true,
+    "d_every_conflict_resolved_by_authority_or_remains_flagged": true,
+    "e_transient_consumer_failures_do_not_lose_commands": true,
+    "duplicate_safeguard_observed": false
+  }
+Chaos failed for seed 17: duplicate_safeguard_observed
+```
+
+The command was run with `DISABLE_DEDUP=1`; reproduce the failure with that environment variable and seed `17`:
+
+```bash
+CHAOS_ALLOW_RESET=1 DISABLE_DEDUP=1 DATABASE_URL=postgres://postgres:postgres@localhost:55432/convergence npm run chaos -- --seed=17 --payments=1000
+```
+
+Sequential recovery run (d), exit code `0`:
+
+```text
+  "seed": 17,
+  "mode": "sequential",
+  "payments": 1000,
+  "events_generated": 2742,
+  "duplicated": 430,
+  "reordered": 3026,
+  "delayed": 1094,
+  "dropped": 211,
+  "stale_ignored": 868,
+  "conflicts_detected": 66,
+  "payments_repaired_by_sweeper": 79,
+  "convergence_lag_ms_p50": 15780,
+  "convergence_lag_ms_p95": 59766,
+  "invariants": {
+    "a_final_state_matches_independent_oracle_after_sweep": true,
+    "b_state_never_regresses_on_stale_events": true,
+    "c_expected_commands_delivered_once_by_idempotency_key": true,
+    "d_every_conflict_resolved_by_authority_or_remains_flagged": true,
+    "e_transient_consumer_failures_do_not_lose_commands": true,
+    "duplicate_safeguard_observed": true
+  }
+```
+
+Conflict demo captured from Compose:
+
+```text
+  "scenario": "conflict",
+  "payment_id": "pay_conflict_1790252795056",
+  "event_sequence": [
+    "payment_failed",
+    "payment_succeeded (late timestamp)"
+  ],
+  "final_status": "succeeded",
+      "kind": "conflict_detected",
+      "reason": "failed conflicted with incoming succeeded",
+      "kind": "verification_pulled",
+      "reason": "Authority resolved payment as succeeded",
+      "kind": "command_emitted",
+      "reason": "Emitted compensate_late_success for orders",
+      "command_type": "compensate_late_success",
+      "status": "delivered"
+```
+
+Outage recovery demo captured from Compose:
+
+```text
+  "scenario": "outage-recovery",
+  "webhook_attempts_rejected": 3,
+  "webhooks_accepted_during_outage": 0,
+  "webhook_redeliveries": 0,
+  "drift_before_sweep": 3,
+  "drift_after_sweep": 0,
+  "repaired_by_sweeper": 3,
+  "final_status": "succeeded"
+```
+
+Oracle source check: `src/chaos.ts` imports the engine ingestion function for the system-under-test path, but `referenceConsume` is implemented locally and does not import or call `engine.ts` or `state.ts` transition logic.
+
+Live `curl http://localhost:3001/metrics` response after the captured demos:
+
+```json
+{"counters":{"conflicts_detected":67,"conflicts_resolved":67,"delivery_retries":1000,"duplicates_dropped":430,"events_applied":1813,"payments_repaired_by_sweeper":82,"stale_events_ignored":868},"outbox":{"delivered":2341},"payments_out_of_sync":0,"convergence_lag_ms":{"p50":15596,"p95":59766}}
+```
 
 ## Tests
 

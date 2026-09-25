@@ -1,0 +1,41 @@
+
+> payment-state-convergence-engine@0.1.0 chaos
+> node --env-file-if-exists=.env --import tsx src/chaos.ts --seed=17 --payments=1000
+
+{
+  "seed": 17,
+  "mode": "sequential",
+  "payments": 1000,
+  "events_generated": 2742,
+  "events_delivered": 3027,
+  "duplicated": 430,
+  "reordered": 3026,
+  "delayed": 1094,
+  "dropped": 211,
+  "stale_conflicts_injected": 66,
+  "stale_ignored": 868,
+  "conflicts_detected": 66,
+  "expected_conflicting_payments": 63,
+  "conflicts_resolved": 66,
+  "payments_repaired_by_sweeper": 79,
+  "delivery_retries": 1000,
+  "commands_expected": 2258,
+  "commands_delivered": 2330,
+  "convergence_lag_ms_p50": 15973,
+  "convergence_lag_ms_p95": 60019,
+  "invariants": {
+    "a_final_state_matches_independent_oracle_after_sweep": true,
+    "b_state_never_regresses_on_stale_events": true,
+    "c_expected_commands_delivered_once_by_idempotency_key": true,
+    "d_every_conflict_resolved_by_authority_or_remains_flagged": true,
+    "e_transient_consumer_failures_do_not_lose_commands": true,
+    "duplicate_safeguard_observed": true
+  },
+  "conflict_audit": {
+    "expected_payment_count": 63,
+    "observed_payment_count": 66,
+    "missing_payments": [],
+    "all_rows_visible_and_resolved_or_flagged": true
+  },
+  "replay": "CHAOS_ALLOW_RESET=1 npm run chaos -- --seed=17 --payments=1000"
+}

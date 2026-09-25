@@ -1,0 +1,19 @@
+
+> payment-state-convergence-engine@0.1.0 demo:scenario
+> node --env-file-if-exists=.env --import tsx src/demo-scenarios.ts outage
+
+{
+  "scenario": "outage-recovery",
+  "payment_ids": [
+    "pay_outage_1790252804671_0",
+    "pay_outage_1790252804671_1",
+    "pay_outage_1790252804671_2"
+  ],
+  "webhook_attempts_rejected": 3,
+  "webhooks_accepted_during_outage": 0,
+  "webhook_redeliveries": 0,
+  "drift_before_sweep": 3,
+  "drift_after_sweep": 0,
+  "repaired_by_sweeper": 3,
+  "final_status": "succeeded"
+}

@@ -1,0 +1,90 @@
+
+> payment-state-convergence-engine@0.1.0 demo:scenario
+> node --env-file-if-exists=.env --import tsx src/demo-scenarios.ts conflict
+
+{
+  "scenario": "conflict",
+  "payment_id": "pay_conflict_1790252795056",
+  "event_sequence": [
+    "payment_failed",
+    "payment_succeeded (late timestamp)"
+  ],
+  "final_status": "succeeded",
+  "decisions": [
+    {
+      "kind": "command_emitted",
+      "event_id": "pay_conflict_1790252795056_failed",
+      "reason": "Emitted cancel_order for orders",
+      "details": {
+        "idempotency_key": "pay_conflict_1790252795056:cancel_order:orders"
+      },
+      "created_at": "2026-09-24T12:26:35.123Z"
+    },
+    {
+      "kind": "command_emitted",
+      "event_id": "pay_conflict_1790252795056_failed",
+      "reason": "Emitted release_stock for inventory",
+      "details": {
+        "idempotency_key": "pay_conflict_1790252795056:release_stock:inventory"
+      },
+      "created_at": "2026-09-24T12:26:35.123Z"
+    },
+    {
+      "kind": "command_emitted",
+      "event_id": "pay_conflict_1790252795056_failed",
+      "reason": "Emitted notify_failure for notifier",
+      "details": {
+        "idempotency_key": "pay_conflict_1790252795056:notify_failure:notifier"
+      },
+      "created_at": "2026-09-24T12:26:35.123Z"
+    },
+    {
+      "kind": "conflict_detected",
+      "event_id": "pay_conflict_1790252795056_late_success",
+      "reason": "failed conflicted with incoming succeeded",
+      "details": {},
+      "created_at": "2026-09-24T12:26:35.135Z"
+    },
+    {
+      "kind": "verification_pulled",
+      "event_id": "pay_conflict_1790252795056_late_success",
+      "reason": "Authority resolved payment as succeeded",
+      "details": {
+        "next_status": "succeeded",
+        "previous_status": "failed"
+      },
+      "created_at": "2026-09-24T12:26:35.135Z"
+    },
+    {
+      "kind": "command_emitted",
+      "event_id": "pay_conflict_1790252795056_late_success",
+      "reason": "Emitted compensate_late_success for orders",
+      "details": {
+        "idempotency_key": "pay_conflict_1790252795056:compensate_late_success:orders"
+      },
+      "created_at": "2026-09-24T12:26:35.135Z"
+    },
+    {
+      "kind": "command_emitted",
+      "event_id": "pay_conflict_1790252795056_late_success",
+      "reason": "Emitted notify_late_success for notifier",
+      "details": {
+        "idempotency_key": "pay_conflict_1790252795056:notify_late_success:notifier"
+      },
+      "created_at": "2026-09-24T12:26:35.135Z"
+    }
+  ],
+  "compensation": [
+    {
+      "id": "2334",
+      "command_type": "compensate_late_success",
+      "target": "orders",
+      "status": "delivered",
+      "attempts": 0,
+      "idempotency_key": "pay_conflict_1790252795056:compensate_late_success:orders",
+      "last_error": null,
+      "created_at": "2026-09-24T12:26:35.135Z",
+      "delivered_at": "2026-09-24T12:26:35.145Z"
+    }
+  ]
+}
